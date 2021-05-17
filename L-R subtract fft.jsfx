@@ -1,0 +1,290 @@
+// based on vocalrediso.ny, a built in nyquist filter for audacity: Released under terms of the GNU General Public License version 2
+// uses some code from https://github.com/Nbickford/REAPERDenoiser
+
+desc: vocal removal/isolation
+//tags: processing vocals stereo
+//author: Michael Pannekoek
+
+slider1:100<0,100,0.1>dry/wet mix (0 dry 100 wet)
+slider2:0<0,2,1{L - R,R - L,both}>Subtract which way?
+slider3:0<-5,5,0.001>strength at Low Cut
+slider4:0<-5,5,0.001>strength at High Cut
+slider5:0<0,24000>Low Cut
+slider6:24000<0,24000>High Cut
+slider8:90<1,180,0.1>Phase width at Low Cut (Degrees)
+slider9:90<1,180,0.1>Phase width at High Cut (Degrees)
+slider10:1<0,1,0.05>Attenuate if different volume
+
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+
+
+@slider
+// convert low cut and high cut to bins every time a slider is changed
+lowBin = max(1, min(slider5, slider6) / srate * SIZE);
+// do not process band 0!;
+highBin = max(slider6, slider5) / srate * SIZE;
+// convert percentage to raw scale factor
+wetMix = slider1/100;
+dryMix = 1-wetMix;
+lowStrength = slider3;
+highstrength = slider4;
+phaseWlow = slider8*$pi/180;
+phaseWhigh = slider9*$pi/180;
+// fill strengthBuffer and phaseWBuffer
+bandIndex = 0;
+loop(SIZE,
+	bandIndex >= lowBin && bandIndex < highBin ?
+	(
+		// only set values for the appropriate frequency range
+		frac = (bandIndex - lowBin)/(highBin - lowBin - 1);
+		// fraction of progress through range [lowBin, highBin)
+		strength = lowStrength* (1 - frac) + highStrength * frac;
+		strengthBuffer[bandIndex] = 10^strength;
+		// precaculate strength (actual value should be positive, so it makes
+		// sense to take the power of ten, but only after the
+		// linear mapping over the spectrum is done.
+		phaseW = phaseWlow * (1 - frac) + phaseWhigh * frac;
+		phaseWBuffer[bandIndex] = phaseW;
+		// precalculate phase width
+	);
+
+	windowBuffer[bandIndex] = sin($pi*(bandIndex+1/2)/SIZE);
+
+	bandIndex += 1;
+	// next index
+);
+
+
+
+@init
+// init variables
+// FFT - fft window size (will be constant)
+SIZE = 4096;
+normSIZE = 1/SIZE;
+
+// track how many half frames of delay from the start we are
+// to mute the first inital buffers
+silence = 2;
+
+// fft has real and complex values thus is twice as large
+bufferFFTIL = SIZE*0;
+bufferFFTIR = SIZE*2;
+bufferFFTO = SIZE*4;
+bufferL = SIZE*6;
+bufferI1L = SIZE*7;
+bufferI2L = SIZE*8;
+bufferR = SIZE*9;
+bufferI1R = SIZE*10;
+bufferI2R = SIZE*11;
+bufferO1C = SIZE*12;
+bufferO2C = SIZE*13;
+strengthBuffer = SIZE*14;
+phaseWBuffer = SIZE*15;
+windowBuffer = SIZE*16;
+freembuf(SIZE*17 + 1);
+
+// samplesCollected tracks the position in the last of the two tiles
+// ranges from 0 to (SIZE/2)-1
+samplesCollected = 0;
+// offset ranges from 0 to SIZE-1
+offset = 0;
+
+// tell reaper what delay this plugin will introduce,
+// so that it can be compensated for
+pdc_delay = SIZE;
+// delay is one full buffer
+pdc_bot_ch = 0; pdc_top_ch = 2;
+// which channels are delayed
+// (channel number must be greater than or equal to 0,
+// but less than 2, so 0 and 1 - LR output).
+
+
+
+@sample
+sampleLeft = spl0;
+sampleRight = spl1;
+// that's a lowercase L in spl, not the number 1.
+// spl0 corresponds to L, spl1 corresponds to R.
+
+// find positions in tile 1 and 2
+tilePos1 = samplesCollected + SIZE/2;
+tilePos2 = samplesCollected;
+
+// apply the selected envelope while writing the sample into the tile buffer
+// See https://en.wikipedia.org/wiki/Window_function
+windowTile1 = windowBuffer[tilePos1];
+windowTile2 = windowBuffer[tilePos2];
+// windowTile2 has a relationship to the other window tile, so
+// it is epressed in this way for accuracy and speed
+
+// subtract or output the center channel from L and R based on slider1
+// if slider1 is less than two, the Left channel is present in the output
+// if slider1 is equal to 2, then the center channel is present in the output,
+// otherwise it is subtracted
+inL = bufferL[offset];
+inR = bufferR[offset];
+out = bufferO1C[tilePos1]*windowTile1 + bufferO2C[tilePos2]*windowTile2;
+
+wetPart = out * wetMix;
+dryPart = (slider2 == 0 ? inL : inR) * dryMix;
+outL = dryPart + wetPart;
+outR = dryPart + wetPart;
+
+// output audio
+silence == 0 ? (
+	spl0 = outL;
+	spl1 = outR;
+) : spl0 = spl1 = 0;
+
+// write to buffers:
+// Left + Right input buffers
+bufferI1L[tilePos1] = sampleLeft * windowTile1;
+bufferI2L[tilePos2] = sampleLeft * windowTile2;
+bufferI1R[tilePos1] = sampleRight * windowTile1;
+bufferI2R[tilePos2] = sampleRight * windowTile2;
+
+// set original L & R buffers
+bufferL[offset] = sampleLeft;
+bufferR[offset] = sampleRight;
+
+// increment positions
+offset += 1;
+samplesCollected += 1;
+
+offset == SIZE ?
+(
+	offset = 0;
+);
+
+// once we reach the end of a tile:
+samplesCollected == SIZE/2 ?
+(
+	// make silence go to 0
+	silence > 0 ? silence -= 1;
+	samplesCollected = 0;
+	// wrap back to 0 on the tile
+
+	// calculate fft for left channel
+	// Loop over each of the audio samples, from index = 0 to SIZE - 1.
+	index = 0;
+	loop(SIZE,
+		bufferFFTIL[2 * index + 0] = bufferI1L[index]*normSIZE;
+		// Real part
+		bufferFFTIL[2 * index + 1] = 0.0;
+		// Imaginary part
+		index += 1;
+		// Next index
+	);
+	// calculate fft in place
+	// size specifies the number of bins
+	// (one complex number for each bin)
+	fft(bufferFFTIL, SIZE);
+	// need to permute the frequency bins to get them in the right order
+	// See https://www.reaper.fm/sdk/js/advfunc.php#js_advanced for more info.
+	fft_permute(bufferFFTIL, SIZE);
+
+	// calculate fft for right channel
+	// Loop over each of the audio samples, from index = 0 to SIZE - 1.
+	index = 0;
+	loop(SIZE,
+		bufferFFTIR[2 * index + 0] = bufferI1R[index]*normSIZE;
+		// Real part
+		bufferFFTIR[2 * index + 1] = 0.0;
+		// Imaginary part
+		index += 1;
+		// Next index
+	);
+	// calculate fft in place
+	// size specifies the number of bins
+	// (one complex number for each bin)
+	fft(bufferFFTIR, SIZE);
+	// need to permute the frequency bins to get them in the right order
+	// See https://www.reaper.fm/sdk/js/advfunc.php#js_advanced for more info.
+	fft_permute(bufferFFTIR, SIZE);
+
+	// Main algorithm
+	bufferFFTO[0] = 0;
+	bufferFFTO[1] = 0;
+	bandIndex = 1;
+	loop(SIZE/2-2,
+		Lreal = bufferFFTIL[bandIndex * 2];
+		Limag = bufferFFTIL[bandIndex * 2 + 1];
+		Rreal = bufferFFTIR[bandIndex * 2];
+		Rimag = bufferFFTIR[bandIndex * 2 + 1];
+		diffreal = Lreal - Rreal;
+		diffimag = Limag - Rimag;
+		mixreal = (slider2 == 0 ? Lreal : Rreal);
+		miximag = (slider2 == 0 ? Limag : Rimag);
+		bandIndex >= lowBin && bandIndex < highBin ?
+		(
+			strength = strengthBuffer[bandIndex];
+			// get strength
+			phaseW = phaseWBuffer[bandIndex];
+			// get phase width
+			normL = sqrt(sqr(Lreal) + sqr(Limag));
+			normR = sqrt(sqr(Rreal) + sqr(Rimag));
+			normprod = normL * normR;
+			cosineval = (Lreal * Rreal + Limag * Rimag) / normprod;
+			uncapped = acos(cosineval) / phaseW;
+			weight1 = min(1, uncapped);
+			// attenulate if phase simmilar
+			weight2 = (weight1 ^ strength);
+			// attenuate if relative norms are very simmilar, and option enabled
+			atten = (sqr(normL - normR)/sqr(normL + normR));
+			weight = weight2 * atten ^ (strength * slider10);
+
+			fftOutReal = slider2 == 2 ? diffreal : mixreal;
+			fftOutImag = slider2 == 2 ? diffimag : miximag;
+			// isolate the mid fft (can just sum real and imaginary component
+			// since fft is a linear operator)
+			fftOutReal *= weight;
+			fftOutImag *= weight;
+			// attenuate by weight to do the actual isolation, and divide by SIZE
+			// to normalize the fft (since SIZE entries in fft buffer)
+			bufferFFTO[bandIndex * 2] = fftOutReal;
+			bufferFFTO[bandIndex * 2 + 1] = fftOutImag;
+		) :
+		(
+			bandIndex >= SIZE/2 ? (
+				bufferFFTO[bandIndex * 2] = 0;
+				bufferFFTO[bandIndex * 2 + 1] = 0;
+			) :
+			(
+				bufferFFTO[bandIndex * 2] = diffreal / SIZE;
+				bufferFFTO[bandIndex * 2 + 1] = diffimag / SIZE;
+			);
+		);
+		bandIndex += 1;
+	);
+	memset(bufferFFTO + SIZE-2, 0, SIZE+2);
+	
+	// apply ifft to calculate center channel, which should now be present in fftBuffer
+	fft_ipermute(bufferFFTO, SIZE);
+	ifft(bufferFFTO, SIZE);
+	
+	// Copy from the complex numbers in fftBuffer to the center tile:
+	index = 0;
+	loop(SIZE,
+		bufferO1C[index] = bufferFFTO[2 * index + 0];
+		index += 1;
+	);
+	
+	temp = bufferI1L;
+	bufferI1L = bufferI2L;
+	bufferI2L = temp;
+	
+	temp = bufferI1R;
+	bufferI1R = bufferI2R;
+	bufferI2R = temp;
+	
+	temp = bufferO1C;
+	bufferO1C = bufferO2C;
+	bufferO2C = temp;
+);
+
+// sliders are serialized automatically
+// thus nothing to serialize, as nothing else makes sense to store
