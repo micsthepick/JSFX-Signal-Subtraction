@@ -21,7 +21,6 @@ out_pin:left output
 out_pin:right output
 
 
-
 @slider
 // convert low cut and high cut to bins every time a slider is changed
 lowBin = max(1, min(slider5, slider6) / srate * SIZE);
